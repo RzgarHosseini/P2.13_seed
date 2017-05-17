@@ -38,13 +38,15 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
 {
     if(dim == 1)
         return; // Nothing to do
+    Triangulation<dim> copy_tria;
+    copy_tria.copy_triangulation(tria);
 
     bool has_cells_with_more_than_dim_faces_on_boundary = true;
 
     while(has_cells_with_more_than_dim_faces_on_boundary) {
         has_cells_with_more_than_dim_faces_on_boundary = false;
 
-        for(auto cell: tria.active_cell_iterators()) {
+        for(auto cell: copy_tria.active_cell_iterators()) {
             unsigned int boundary_face_counter = 0;
             for(unsigned int f=0; f<GeometryInfo<dim>::faces_per_cell; ++f)
                 if(cell->face(f)->at_boundary())
@@ -55,82 +57,21 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
             }
         }
         if(has_cells_with_more_than_dim_faces_on_boundary)
-            tria.refine_global(1);
+            copy_tria.refine_global(1);
     }
 
-    tria.refine_global(1);
+    copy_tria.refine_global(1);
 
-    std::vector<bool> cells_to_remove(tria.n_active_cells(), false);
-    std::vector<Point<spacedim> > vertices = tria.get_vertices();
-    std::vector<CellData<dim> > cells(tria.n_active_cells());
-    SubCellData                 subcelldata;
+    std::vector<bool> cells_to_remove(copy_tria.n_active_cells(), false);
+    std::vector<Point<spacedim> > vertices = copy_tria.get_vertices();
 
-
-    typename Triangulation<dim,spacedim>::active_face_iterator
-            face = tria.begin_active_face(),
-            endf = tria.end_face();
-
-
-    std::map<typename Triangulation<dim,spacedim>::active_face_iterator, unsigned int> face_index_map;
-
-    // Face counter for both dim == 2 and dim == 3
-    unsigned int f=0;
-    switch (dim)
-    {
-    case 2:
-    {
-        subcelldata.boundary_lines.resize(tria.n_active_faces());
-        for (; face != endf; ++face)
-            if (face->at_boundary())
-            {
-                for (unsigned int i=0; i<GeometryInfo<dim>::vertices_per_face; ++i)
-                    subcelldata.boundary_lines[f].vertices[i] = face->vertex_index(i);
-                subcelldata.boundary_lines[f].boundary_id = face->boundary_id();
-                subcelldata.boundary_lines[f].manifold_id = face->manifold_id();
-                face_index_map[face] = f;
-                ++f;
-
-            }
-        subcelldata.boundary_lines.resize(f);
-    }
-        break;
-    case 3:
-    {
-        subcelldata.boundary_quads.resize(tria.n_active_faces());
-        for (; face != endf; ++face)
-            if (face->at_boundary())
-            {
-                for (unsigned int i=0; i<GeometryInfo<dim>::vertices_per_face; ++i)
-                    subcelldata.boundary_quads[f].vertices[i] = face->vertex_index(i);
-                subcelldata.boundary_quads[f].boundary_id = face->boundary_id();
-                subcelldata.boundary_quads[f].manifold_id = face->manifold_id();
-                face_index_map[face] = f;
-                ++f;
-            }
-        subcelldata.boundary_quads.resize(f);
-    }
-        break;
-    default:
-        Assert(false, ExcInternalError());
-    }
-
-    std::vector<bool> faces_to_remove(f,false);
+    std::vector<bool> faces_to_remove(copy_tria.n_raw_faces(),false);
 
     std::vector<CellData<dim> > cells_to_add;
     SubCellData                 subcelldata_to_add;
+    std::vector<bool> vertices_touched(copy_tria.n_vertices(), false);
 
-    f = 0;
-    unsigned int new_f = 0;
-    for(auto cell : tria.active_cell_iterators()) {
-        unsigned int id = cell->active_cell_index();
-
-        for (unsigned int i=0; i<GeometryInfo<dim>::vertices_per_cell; ++i)
-            cells[id].vertices[i] = cell->vertex_index(i);
-        cells[id].material_id = cell->material_id();
-        cells[id].manifold_id = cell->manifold_id();
-
-        unsigned int boundary_face_counter = 0;
-
+    for(auto cell : copy_tria.active_cell_iterators()) {
         double angle_fraction = 0;
         unsigned int vertex_at_corner = numbers::invalid_unsigned_int;
 
@@ -172,36 +113,48 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
                 cells_to_remove[cell->neighbor(n1)->active_cell_index()] = true;
                 cells_to_remove[cell->neighbor(n2)->active_cell_index()] = true;
 
-                faces_to_remove[face_index_map[cell->face(f1)]] = true;
-                faces_to_remove[face_index_map[cell->face(f2)]] = true;
+                faces_to_remove[cell->face(f1)->index()] = true;
+                faces_to_remove[cell->face(f2)->index()] = true;
 
-                faces_to_remove[face_index_map[cell->neighbor(n1)->face(f1)]] = true;
-                faces_to_remove[face_index_map[cell->neighbor(n2)->face(f2)]] = true;
+                faces_to_remove[cell->neighbor(n1)->face(f1)->index()] = true;
+                faces_to_remove[cell->neighbor(n2)->face(f2)->index()] = true;
             };
 
             CellData<dim> c1, c2;
 
             if(dim == 2) {
-                cells_to_remove[cell->active_cell_index()] = true;
-
-
                 switch(vertex_at_corner) {
                 case 0:
                     flags_removal(0,2,3,1);
-                    c1.vertices.push_back(cell->vertex_index(0));
-                    c1.vertices.push_back(cell->vertex_index(3));
-                    c1.vertices.push_back(cell->neighbor(3)->vertex_index(2));
-                    c1.vertices.push_back(cell->neighbor(3)->vertex_index(3));
+                    c1.vertices[0] = cell->vertex_index(0);
+                    c1.vertices[1] = cell->vertex_index(3);
+                    c1.vertices[2] = cell->neighbor(3)->vertex_index(2);
+                    c1.vertices[3] = cell->neighbor(3)->vertex_index(3);
+                    c1.manifold_id = cell->manifold_id();
+                    c1.material_id = cell->material_id();
 
-                    c2.vertices.push_back(cell->vertex_index(3));
-                    c2.vertices.push_back(cell->vertex_index(0));
-                    c2.vertices.push_back(cell->neighbor(1)->vertex_index(3));
-                    c2.vertices.push_back(cell->neighbor(1)->vertex_index(1));
+                    c2.vertices[0] = cell->vertex_index(0);
+                    c2.vertices[1] = cell->neighbor(1)->vertex_index(1);
+                    c2.vertices[2] = cell->vertex_index(3);
+                    c2.vertices[3] = cell->neighbor(1)->vertex_index(3);
+                    c2.manifold_id = cell->manifold_id();
+                    c2.material_id = cell->material_id();
 
                     CellData<1> l1, l2;
-                    l1.vertices[0] =
+                    l1.vertices[0] = cell->vertex_index(0);
+                    l1.vertices[1] = cell->neighbor(3)->vertex_index(2);
+                    l1.boundary_id = cell->line(0)->boundary_id();
+                    l1.manifold_id = cell->line(0)->manifold_id();
+                    subcelldata_to_add.boundary_lines.push_back(l1);
 
-                    subcelldata_to_add.boundary_lines.push_back();
+                    l2.vertices[0] = cell->vertex_index(0);
+                    l2.vertices[1] = cell->neighbor(1)->vertex_index(1);
+                    l2.boundary_id = cell->line(2)->boundary_id();
+                    l2.manifold_id = cell->line(2)->manifold_id();
+                    subcelldata_to_add.boundary_lines.push_back(l2);
+
+                    cells_to_add.push_back(c1);
+                    cells_to_add.push_back(c2);
                     break;
 //                case 1:
 //                    flags_removal(1,2,3,0);
@@ -221,6 +174,57 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
             std::cout << "Angle fraction: " << angle_fraction << std::endl;
     }
 
+    // add the cells that were not marked as skipped
+    for (auto cell : copy_tria.active_cell_iterators())
+    {
+        if (cells_to_remove[cell->active_cell_index()] == false)
+        {
+            CellData<dim> c;
+            for (unsigned int v=0; v<GeometryInfo<dim>::vertices_per_cell; ++v)
+                c.vertices[v] = cell->vertex_index(v);
+            c.manifold_id = cell->manifold_id();
+            c.material_id = cell->material_id();
+            cells_to_add.push_back(c);
+        }
+    }
+
+    // Face counter for both dim == 2 and dim == 3
+    typename Triangulation<dim,spacedim>::active_face_iterator
+            face = copy_tria.begin_active_face(),
+            endf = copy_tria.end_face();
+    for (; face != endf; ++face)
+        if (face->at_boundary() && faces_to_remove[face->index()] == false)
+        {
+            for (unsigned int l=0; l<GeometryInfo<dim>::lines_per_face; ++l)
+            {
+                CellData<1> line;
+                if (dim == 2)
+                {
+                    for (unsigned int v=0; v<GeometryInfo<1>::vertices_per_cell; ++v)
+                        line.vertices[v] = face->vertex_index(0);
+                    line.boundary_id = face->boundary_id();
+                    line.manifold_id = face->manifold_id();
+                }
+                else
+                {
+                    for (unsigned int v=0; v<GeometryInfo<1>::vertices_per_cell; ++v)
+                        line.vertices[v] = face->line(l)->vertex_index(0);
+                    line.boundary_id = face->line(l)->boundary_id();
+                    line.manifold_id = face->line(l)->manifold_id();
+                }
+                subcelldata_to_add.boundary_lines.push_back(line);
+            }
+            if (dim == 3)
+            {
+                CellData<2> quad;
+                for (unsigned int v=0; v<GeometryInfo<2>::vertices_per_cell; ++v)
+                    quad.vertices[v] = face->vertex_index(0);
+                quad.boundary_id = face->boundary_id();
+                quad.manifold_id = face->manifold_id();
+                subcelldata_to_add.boundary_quads.push_back(quad);
+            }
+        }
+    new_tria.create_triangulation(vertices_to_add, cells_to_add, subcelldata_to_add);
 }
 
 
