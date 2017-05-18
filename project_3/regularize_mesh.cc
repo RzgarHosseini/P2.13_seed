@@ -23,6 +23,11 @@
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/manifold_lib.h>
 #include <deal.II/grid/grid_out.h>
+#include <deal.II/grid/grid_tools.h>
+#include <deal.II/grid/grid_reordering.h>
+
+#include <deal.II/opencascade/utilities.h>
+#include <deal.II/opencascade/boundary_lib.h>
 
 #include <iostream>
 #include <fstream>
@@ -32,21 +37,18 @@ using namespace dealii;
 
 
 template<int dim, int spacedim>
-void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
-                      const Triangulation<dim,spacedim> &tria,
-                      const double limit_angle_fraction=.75)
+void regularize_mesh (Triangulation<dim,spacedim> &tria,
+                      const double limit_angle_fraction=.85)
 {
     if(dim == 1)
         return; // Nothing to do
-    Triangulation<dim> copy_tria;
-    copy_tria.copy_triangulation(tria);
 
     bool has_cells_with_more_than_dim_faces_on_boundary = true;
 
     while(has_cells_with_more_than_dim_faces_on_boundary) {
         has_cells_with_more_than_dim_faces_on_boundary = false;
 
-        for(auto cell: copy_tria.active_cell_iterators()) {
+        for(auto cell: tria.active_cell_iterators()) {
             unsigned int boundary_face_counter = 0;
             for(unsigned int f=0; f<GeometryInfo<dim>::faces_per_cell; ++f)
                 if(cell->face(f)->at_boundary())
@@ -57,21 +59,21 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
             }
         }
         if(has_cells_with_more_than_dim_faces_on_boundary)
-            copy_tria.refine_global(1);
+            tria.refine_global(1);
     }
 
-    copy_tria.refine_global(1);
+    tria.refine_global(1);
 
-    std::vector<bool> cells_to_remove(copy_tria.n_active_cells(), false);
-    std::vector<Point<spacedim> > vertices = copy_tria.get_vertices();
+    std::vector<bool> cells_to_remove(tria.n_active_cells(), false);
+    std::vector<Point<spacedim> > vertices = tria.get_vertices();
 
-    std::vector<bool> faces_to_remove(copy_tria.n_raw_faces(),false);
+    std::vector<bool> faces_to_remove(tria.n_raw_faces(),false);
 
     std::vector<CellData<dim> > cells_to_add;
     SubCellData                 subcelldata_to_add;
-    std::vector<bool> vertices_touched(copy_tria.n_vertices(), false);
+    std::vector<bool> vertices_touched(tria.n_vertices(), false);
 
-    for(auto cell : copy_tria.active_cell_iterators()) {
+    for(auto cell : tria.active_cell_iterators()) {
         double angle_fraction = 0;
         unsigned int vertex_at_corner = numbers::invalid_unsigned_int;
 
@@ -105,9 +107,8 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
         }
 
         if(angle_fraction > limit_angle_fraction) {
-            std::cout << "Eureka! " << angle_fraction << std::endl;
 
-            auto flags_removal = [&](unsigned int f1, unsigned int f2,
+           auto flags_removal = [&](unsigned int f1, unsigned int f2,
                                       unsigned int n1, unsigned int n2) -> void {
                 cells_to_remove[cell->active_cell_index()] = true;
                 cells_to_remove[cell->neighbor(n1)->active_cell_index()] = true;
@@ -120,62 +121,83 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
                 faces_to_remove[cell->neighbor(n2)->face(f2)->index()] = true;
             };
 
-            CellData<dim> c1, c2;
+            auto cell_creation = [&](
+                        const unsigned int v0,
+                        const unsigned int v1,
+                        const unsigned int f0,
+                        const unsigned int f1,
+
+                        const unsigned int n0,
+                        const unsigned int v0n0,
+                        const unsigned int v1n0,
+
+                        const unsigned int n1,
+                        const unsigned int v0n1,
+                        const unsigned int v1n1) {
+                CellData<dim> c1, c2;
+                CellData<1> l1, l2;
+
+                c1.vertices[0] = cell->vertex_index(v0);
+                c1.vertices[1] = cell->vertex_index(v1);
+                c1.vertices[2] = cell->neighbor(n0)->vertex_index(v0n0);
+                c1.vertices[3] = cell->neighbor(n0)->vertex_index(v1n0);
+
+                c1.manifold_id = cell->manifold_id();
+                c1.material_id = cell->material_id();
+
+                c2.vertices[0] = cell->vertex_index(v0);
+                c2.vertices[1] = cell->neighbor(n1)->vertex_index(v0n1);
+                c2.vertices[2] = cell->vertex_index(v1);
+                c2.vertices[3] = cell->neighbor(n1)->vertex_index(v1n1);
+
+                c2.manifold_id = cell->manifold_id();
+                c2.material_id = cell->material_id();
+
+                l1.vertices[0] = cell->vertex_index(v0);
+                l1.vertices[1] = cell->neighbor(n0)->vertex_index(v0n0);
+
+                l1.boundary_id = cell->line(f0)->boundary_id();
+                l1.manifold_id = cell->line(f0)->manifold_id();
+                subcelldata_to_add.boundary_lines.push_back(l1);
+
+                l2.vertices[0] = cell->vertex_index(v0);
+                l2.vertices[1] = cell->neighbor(n1)->vertex_index(v0n1);
+
+                l2.boundary_id = cell->line(f1)->boundary_id();
+                l2.manifold_id = cell->line(f1)->manifold_id();
+                subcelldata_to_add.boundary_lines.push_back(l2);
+
+                cells_to_add.push_back(c1);
+                cells_to_add.push_back(c2);
+            };
 
             if(dim == 2) {
                 switch(vertex_at_corner) {
                 case 0:
                     flags_removal(0,2,3,1);
-                    c1.vertices[0] = cell->vertex_index(0);
-                    c1.vertices[1] = cell->vertex_index(3);
-                    c1.vertices[2] = cell->neighbor(3)->vertex_index(2);
-                    c1.vertices[3] = cell->neighbor(3)->vertex_index(3);
-                    c1.manifold_id = cell->manifold_id();
-                    c1.material_id = cell->material_id();
-
-                    c2.vertices[0] = cell->vertex_index(0);
-                    c2.vertices[1] = cell->neighbor(1)->vertex_index(1);
-                    c2.vertices[2] = cell->vertex_index(3);
-                    c2.vertices[3] = cell->neighbor(1)->vertex_index(3);
-                    c2.manifold_id = cell->manifold_id();
-                    c2.material_id = cell->material_id();
-
-                    CellData<1> l1, l2;
-                    l1.vertices[0] = cell->vertex_index(0);
-                    l1.vertices[1] = cell->neighbor(3)->vertex_index(2);
-                    l1.boundary_id = cell->line(0)->boundary_id();
-                    l1.manifold_id = cell->line(0)->manifold_id();
-                    subcelldata_to_add.boundary_lines.push_back(l1);
-
-                    l2.vertices[0] = cell->vertex_index(0);
-                    l2.vertices[1] = cell->neighbor(1)->vertex_index(1);
-                    l2.boundary_id = cell->line(2)->boundary_id();
-                    l2.manifold_id = cell->line(2)->manifold_id();
-                    subcelldata_to_add.boundary_lines.push_back(l2);
-
-                    cells_to_add.push_back(c1);
-                    cells_to_add.push_back(c2);
+                    cell_creation(0,3, 0,2, 3,2,3,  1,1,3);
                     break;
-//                case 1:
-//                    flags_removal(1,2,3,0);
-//                    break;
-//                case 2:
-//                    flags_removal(3,0,1,2);
-//                    break;
-//                case 3:
-//                    flags_removal(3,1,0,2);
-//                    break;
+                case 1:
+                    flags_removal(1,2,3,0);
+                    cell_creation(1,2, 2,1, 0,0,2, 3,3,2);
+                    break;
+                case 2:
+                    flags_removal(3,0,1,2);
+                    cell_creation(2,1, 3,0, 1,3,1, 2,0,1);
+                    break;
+                case 3:
+                    flags_removal(3,1,0,2);
+                    cell_creation(3,0, 1,3, 2,1,0, 0,2,0);
+                    break;
                 }
             } else {
                 Assert(false, ExcNotImplemented());
             }
         }
-        else
-            std::cout << "Angle fraction: " << angle_fraction << std::endl;
     }
 
     // add the cells that were not marked as skipped
-    for (auto cell : copy_tria.active_cell_iterators())
+    for (auto cell : tria.active_cell_iterators())
     {
         if (cells_to_remove[cell->active_cell_index()] == false)
         {
@@ -190,8 +212,8 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
 
     // Face counter for both dim == 2 and dim == 3
     typename Triangulation<dim,spacedim>::active_face_iterator
-            face = copy_tria.begin_active_face(),
-            endf = copy_tria.end_face();
+            face = tria.begin_active_face(),
+            endf = tria.end_face();
     for (; face != endf; ++face)
         if (face->at_boundary() && faces_to_remove[face->index()] == false)
         {
@@ -201,14 +223,14 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
                 if (dim == 2)
                 {
                     for (unsigned int v=0; v<GeometryInfo<1>::vertices_per_cell; ++v)
-                        line.vertices[v] = face->vertex_index(0);
+                        line.vertices[v] = face->vertex_index(v);
                     line.boundary_id = face->boundary_id();
                     line.manifold_id = face->manifold_id();
                 }
                 else
                 {
                     for (unsigned int v=0; v<GeometryInfo<1>::vertices_per_cell; ++v)
-                        line.vertices[v] = face->line(l)->vertex_index(0);
+                        line.vertices[v] = face->line(l)->vertex_index(v);
                     line.boundary_id = face->line(l)->boundary_id();
                     line.manifold_id = face->line(l)->manifold_id();
                 }
@@ -218,33 +240,57 @@ void regularize_mesh (Triangulation<dim,spacedim> &new_tria,
             {
                 CellData<2> quad;
                 for (unsigned int v=0; v<GeometryInfo<2>::vertices_per_cell; ++v)
-                    quad.vertices[v] = face->vertex_index(0);
+                    quad.vertices[v] = face->vertex_index(v);
                 quad.boundary_id = face->boundary_id();
                 quad.manifold_id = face->manifold_id();
                 subcelldata_to_add.boundary_quads.push_back(quad);
             }
         }
-    new_tria.create_triangulation(vertices_to_add, cells_to_add, subcelldata_to_add);
+    GridTools::delete_unused_vertices(vertices, cells_to_add, subcelldata_to_add);
+    GridReordering<dim,spacedim>::reorder_cells(cells_to_add, true);
+
+    // Save manifolds
+    auto manifold_ids = tria.get_manifold_ids();
+    std::map<types::manifold_id, const Manifold<dim,spacedim>*> manifolds;
+    // Set manifolds in new Triangulation
+    for(auto manifold_id: manifold_ids)
+        if(manifold_id != numbers::invalid_manifold_id)
+            manifolds[manifold_id] = &tria.get_manifold(manifold_id);
+
+    tria.clear();
+
+    tria.create_triangulation(vertices, cells_to_add, subcelldata_to_add);
+
+    // Restore manifolds
+    for(auto manifold_id: manifold_ids)
+        if(manifold_id != numbers::invalid_manifold_id)
+            tria.set_manifold(manifold_id, *manifolds[manifold_id]);
 }
 
 
 
 int main ()
 {
-    Point<2> center;
-    const SphericalManifold<2> manifold_description(center);
+    const SphericalManifold<2> m0;
 
-    Triangulation<2> triangulation;
-    Triangulation<2> new_triangulation;
-    GridGenerator::hyper_cube (triangulation,-1,1);
+    Triangulation<2> tria1;
+    GridGenerator::hyper_cube(tria1,-1,1);
+    tria1.set_all_manifold_ids_on_boundary(0);
+    tria1.set_manifold(0, m0);
 
-    triangulation.set_all_manifold_ids_on_boundary(0);
-    triangulation.set_manifold(0, manifold_description);
+    tria1.refine_global(2);
+    regularize_mesh (tria1);
+    //tria1.refine_global(1);
 
-    regularize_mesh (new_triangulation, triangulation);
+    Triangulation<2> tria2;
+    GridGenerator::hyper_ball(tria2, Point<2>(), std::sqrt(2.0));
+    tria2.set_all_manifold_ids_on_boundary(0);
+    tria2.set_manifold(0, m0);
+    tria2.refine_global(3);
 
     std::ofstream out ("grid-1.vtk");
+    std::ofstream out2 ("grid-2.vtk");
     GridOut grid_out;
-    grid_out.write_vtk (new_triangulation, out);
-    std::cout << "Grid written to grid-1.vtk" << std::endl;
+    grid_out.write_vtk (tria1, out);
+    grid_out.write_vtk (tria2, out2);
 }
